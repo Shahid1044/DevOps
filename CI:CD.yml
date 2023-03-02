@@ -1,0 +1,256 @@
+default:
+    tags:
+      - docker
+    image: $DOCKER_IO_PROXY/node:14.16
+  
+  variables:
+    FF_USE_FASTZIP: 1
+    CYPRESS_CACHE_FOLDER: $CI_PROJECT_DIR/.cache/cypress
+    DOCKER_IO_PROXY: registry.abc.com/docker-io
+    GCR_IO_PROXY: registry.abc.com/gcr-io
+    COMPOSE_PROJECT_NAME: abc-$CI_JOB_ID
+  
+  workflow:
+    rules:
+      - if: $CI_COMMIT_BRANCH == "dev" 
+        variables:
+          REGISTRY_NAMESPACE: registry.abc.com/images-staging/abc
+          IMAGE_API: registry.abc.com/images-staging/abc/api
+          IMAGE_API_SHA: registry.abc.com/images-staging/abc/api_sha
+          IMAGE_API_UNTESTED: registry.abc.com/images-staging/abc/untested/api_sha
+          IMAGE_FE: registry.abc.com/images-staging/abc/frontend
+          IMAGE_FE_SHA: registry.abc.com/images-staging/abc/frontend_sha
+          IMAGE_FE_UNTESTED: registry.abc.com/images-staging/abc/untested/frontend_sha
+  
+      - if: $CI_COMMIT_BRANCH == "master" 
+        variables:
+          REGISTRY_NAMESPACE: registry.abc.com/prod/abc
+          IMAGE_API: registry.abc.com/prod/abc/api
+          IMAGE_API_SHA: registry.abc.com/prod/abc/api_sha
+          IMAGE_API_UNTESTED: registry.abc.com/prod/abc/untested/api_sha
+          IMAGE_FE: registry.abc.com/prod/abc/frontend
+          IMAGE_FE_SHA: registry.abc.com/prod/abc/frontend_sha
+          IMAGE_FE_UNTESTED: registry.abc.com/prod/abc/untested/frontend_sha
+
+  .cache:
+    cache:
+      key: ${CI_COMMIT_REF_SLUG}
+      policy: pull
+      paths:
+        - node_modules/
+        - .cache/cypress/
+    before_script:
+      - yarn install --frozen-lockfile
+  
+  .deploy:
+    variables:
+      DOCKER_CONFIG: /root/.docker
+      GIT_STRATEGY: none
+  
+  stages:
+    - init
+    - build
+    - test
+    - publish
+    - e2e
+    - promote
+    - deploy
+  
+  check-env:
+    stage: init
+  
+    script:
+      - node --version
+      - pwd
+      
+
+  ####################
+  ###      Build     ###
+  ####################
+  
+  app:build:
+    stage: build
+    extends: .cache
+    script:
+      - yarn run build app 
+    after_script:
+      - cp /root/.npmrc .
+      - tar -zcvf context.tar.gz .npmrc yarn.lock dist/apps -C apps Dockerfile
+    artifacts:
+      paths: ['context.tar.gz']
+      expire_in: 1 hour
+  
+  app:test:
+    stage: test
+    script:
+      - bundle install
+      - bundle exec rspec --format progress --format RspecJunitFormatter --out rspec.xml
+    artifacts:
+      when: always
+      paths:
+        - rspec.xml
+      reports:
+        junit: rspec.xml
+  
+  apa:push-image:
+    stage: publish
+    needs: ['app:build']
+    extends: .deploy
+    image:
+      name: $GCR_IO_PROXY/kaniko-project/executor:debug
+      entrypoint: ['']
+    variables:
+      IMAGE_LABELS: >
+        --label org.opencontainers.image.source=$CI_PROJECT_URL
+        --label org.opencontainers.image.revision=$CI_COMMIT_SHA
+        --label org.opencontainers.image.version=TBD
+        --label org.opencontainers.image.ref.name=$IMAGE_API_SHA:$CI_COMMIT_SHA
+        --label org.opencontainers.image.vendor=EPG
+        --label org.opencontainers.image.title=tms_api
+        --label org.opencontainers.image.url=tms.epg.com
+        --label org.opencontainers.image.documentation=TBD
+        --label com.epg.git.branch-or-tag=$CI_COMMIT_REF_NAME
+        --label com.epg.git.commit.url=$CI_PROJECT_URL/commit/$CI_COMMIT_SHA
+        --label com.epg.git.pipeline.url=$CI_PIPELINE_URL
+        --label com.epg.git.job.url=$CI_JOB_URL
+        --label maintainer=EPG
+    script:
+      - /kaniko/executor
+        --context tar://context.tar.gz
+        --destination $IMAGE_API_UNTESTED:$CI_COMMIT_SHA
+        --label org.opencontainers.image.created=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        $IMAGE_LABELS
+  
+  ####################
+  ###     e2e      ##
+  ####################
+  
+  .get-container-id: &get-container-id |
+    # Getting Container ID
+    CONTAINER_ID=$(basename $(cat /proc/1/cpuset))
+    echo $CONTAINER_ID
+  
+  e2e:
+      image: registry.abc.com/docker-io/docker:20.10-dind
+    stage: e2e
+    needs:
+      - job: 'app:push-image'
+        artifacts: false
+    cache:
+      key: ${CI_COMMIT_REF_SLUG}
+      policy: pull
+      paths:
+        - node_modules/
+        - .cache/cypress/
+    before_script:
+      - apk add docker docker-compose
+      - apk add curl
+      - curl --version
+      - docker-compose --version
+      - apk add --update nodejs
+      - node -v
+      - apk add npm
+      - npm --version
+      - apk add yarn
+      - yarn --version
+      - npm install -g ts-node
+      - ts-node -v
+      - yarn add --dev tsconfig-paths
+      - docker-compose -f docker-compose-e2e.yml up -d
+      - sleep 20
+      - docker-compose -f docker-compose-e2e.yml logs || true
+      
+    script:
+      # Following two commands are for debugging purposes only.
+      - docker ps
+      - docker network list
+      #   - docker-compose -f docker-compose-e2e.yml logs || true
+      - *get-container-id
+      # Connect current container to network created by compose.
+      - docker network connect ${COMPOSE_PROJECT_NAME}_default $CONTAINER_ID
+      # Following command are for debugging purposes only.
+      - docker network inspect ${COMPOSE_PROJECT_NAME}_default || true
+      # - yarn run e2e frontend-e2e --headless --browser chrome
+      # dont need to sleep because compose file have healthcheck for keyclock
+      - sleep 30
+      - curl -v http://app:4200 || true
+      - yarn run console seed
+  
+      - docker run
+        -v $PWD:/src
+        -v /home/gitlab-runner/npmrc_regestry_writer:/root/.npmrc:ro
+        --network=${COMPOSE_PROJECT_NAME}_default
+        -w=/src
+        $DOCKER_IO_PROXY/cypress/browsers:node14.16.0-chrome89-ff77
+        /bin/bash -lc '
+        ls -la /root/.npmrc &&
+        export CYPRESS_CACHE_FOLDER=/src/.cache/cypress &&
+        yarn install --frozen-lockfile &&
+        yarn run e2e frontend-e2e --headless --browser chrome'
+    after_script:
+      # - docker-compose -f docker-compose-e2e.yml logs || true
+      # Get again, `script` and `after_script` have different env blocks.
+      - *get-container-id
+      # Always use `|| true` on something that may fail we absolutely ned
+      # to be sure all containers we created are stopped.
+      # Don't forget to detach current container from the network so `down`
+      # can clean it up.
+      - docker network disconnect ${COMPOSE_PROJECT_NAME}_default $CONTAINER_ID || true
+      - docker-compose -f docker-compose-e2e.yml down || true
+      # Following two commands are for debugging purposes only.
+      - docker ps
+      - docker network list
+  
+    artifacts:
+      expire_in: 1 week
+      when: always
+      paths:
+        - dist/cypress/apps/frontend-e2e/videos
+        - dist/cypress/apps/frontend-e2e/screenshots
+      reports:
+        junit:
+          - dist/cypress/apps/frontend-e2e/results/TEST-*.xml
+  
+  .retag-images:
+    stage: promote
+    needs:
+      - job: 'e2e'
+        artifacts: false
+    extends: .deploy
+    image:
+      name: $GCR_IO_PROXY/go-containerregistry/crane:debug
+      entrypoint: ['']
+    variables:
+      TAG: $CI_COMMIT_SHA
+    script:
+      - crane copy $IMAGE_API_UNTESTED:$TAG $IMAGE_API_SHA:$TAG
+      - crane copy $IMAGE_FE_UNTESTED:$TAG $IMAGE_FE_SHA:$TAG
+    after_script:
+      - crane delete $IMAGE_API_UNTESTED:$TAG
+      - crane delete $IMAGE_FE_UNTESTED:$TAG
+  
+  retag-images:dev:
+    extends: .retag-images
+    rules:s
+      - if: $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "master"
+    before_script:
+      # tag most recent images with tag 'latest'
+      - crane copy $IMAGE_API_UNTESTED:$TAG $IMAGE_API:$TAG
+      - crane copy $IMAGE_FE_UNTESTED:$TAG $IMAGE_FE:$TAG
+  deploy-to-k8s:
+    stage: deploy
+    needs:
+      - job: 'retag-images:dev'
+        optional: true
+      
+    rules:
+      - if: $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "master"
+        when: manual
+        allow_failure: true
+    inherit:
+      variables: false
+    variables:
+      UPSTREAM_COMMIT_SHA: $CI_COMMIT_SHA
+    script:
+          kubectl apply -f k8s/$CI_COMMIT_BRANCH
+  
